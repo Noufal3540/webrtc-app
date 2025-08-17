@@ -1,7 +1,15 @@
+require('dotenv').config();
+
+console.log("JWT_SECRET is:", process.env.JWT_SECRET);
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 const server = http.createServer(app);
@@ -12,14 +20,184 @@ const io = new Server(server, {
   }
 });
 
+let users = [];
+
+// middlewares
+app.use(express.json());
+app.use(cors({
+  origin: process.env.CLIENT_ORIGIN,     // e.g. http://localhost:3000
+  credentials: true
+}));
+
+app.use(cookieParser());
+
+app.post('/register', async (req, res) => {
+  const { username, password } = req.body;
+
+  // Check if user already exists
+  const existingUser = users.find(user => user.username === username);
+  if (existingUser) {
+      return res.status(400).json({ message: 'User already exists' });
+  }
+
+  // Hash the password
+  const hashedPassword = await bcrypt.hash(password, 10);
+
+  // Store the user
+  users.push({ username, password: hashedPassword });
+
+  res.status(201).json({ message: 'User registered successfully' });
+});
+
+// app.post('/login', async (req, res) => {
+//   const { username, password } = req.body;
+
+//   // 1️⃣ Check if user exists
+//   const user = users.find(user => user.username === username);
+//   if (!user) {
+//       return res.status(400).json({ message: 'Invalid credentials' });
+//   }
+
+//   // 2️⃣ Compare password with stored hashed password
+//   const isPasswordValid = await bcrypt.compare(password, user.password);
+//   if (!isPasswordValid) {
+//       return res.status(400).json({ message: 'Invalid credentials' });
+//   }
+
+//   // 3️⃣ Generate JWT token
+//   const token = jwt.sign(
+//       { username: user.username },   // payload
+//       process.env.JWT_SECRET,        // secret key from .env
+//       { expiresIn: '1h' }             // token expiry time
+//   );
+
+//   // 4️⃣ Send token to client
+//   res.json({ token });
+// });
+
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+
+  // 1️⃣ Check if user exists
+  const user = users.find(user => user.username === username);
+  if (!user) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+  }
+
+  // 2️⃣ Compare password with stored hashed password
+  const isPasswordValid = await bcrypt.compare(password, user.password);
+  if (!isPasswordValid) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+  }
+
+  // 3️⃣ Generate JWT token
+  const token = jwt.sign(
+      { username: user.username },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+  );
+
+  // 4️⃣ Set both cookie and return token
+  res.cookie('authToken', token, {
+    httpOnly: true,          // Prevent XSS attacks
+    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+    sameSite: 'strict',      // CSRF protection
+    maxAge: 3600000          // 1 hour in milliseconds
+  });
+
+  // 5️⃣ Send token to client (for API calls)
+  res.json({ token });
+});
+
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization']; // format: "Bearer token"
+  console.log('🔒 Authenticating token from request headers:', authHeader);
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token){
+    console.error('🔒 No token provided in request headers');
+    console.log(token);
+    return res.status(401).json({ error: 'Access denied, no token provided' });
+  } 
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = user; // save the payload to req.user
+    next();
+  });
+}
+
+function authenticateTokenWithCookie(req, res, next) {
+  // Try Authorization header first
+  const authHeader = req.headers['authorization'];
+  let token = authHeader && authHeader.split(' ')[1];
+  
+  // If no header token, try cookie
+  if (!token && req.cookies) {
+    token = req.cookies.authToken;
+    console.log('🔒 Using token from cookie');
+  }
+  
+  if (!token) {
+    console.error('🔒 No token provided');
+    
+    // For browser requests, redirect to auth page
+    if (req.headers.accept && req.headers.accept.includes('text/html')) {
+      return res.redirect('/auth');
+    }
+    
+    return res.status(401).json({ error: 'Access denied, no token provided' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      console.error('🔒 Invalid token:', err.message);
+      
+      // Clear invalid cookie
+      if (req.cookies && req.cookies.authToken) {
+        res.clearCookie('authToken');
+      }
+      
+      if (req.headers.accept && req.headers.accept.includes('text/html')) {
+        return res.redirect('/auth');
+      }
+      
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+    
+    req.user = user;
+    next();
+  });
+}
+
+
+// Serve auth frontend static files
+// app.use('/auth', express.static(path.join(__dirname, '../auth-frontend/dist')));
+
+app.get('/verify-token', authenticateTokenWithCookie, (req, res) => {
+  console.log("Headers:",req.headers);
+  res.json({ valid: true, user: req.user });
+});
+
 // Store room information
 const rooms = new Map();
 
 // Serve static files
-app.get('/', (req, res) => {
+app.get('/',authenticateTokenWithCookie, (req, res) => {
+
+  console.log("Headers:",req.headers);
   res.sendFile(path.join(__dirname, '../client/index.html'));
 });
+
 app.use(express.static(path.join(__dirname, '../client')));
+
+app.get('/auth', (req, res) => {
+  res.sendFile(path.join(__dirname, '../auth-frontend/dist/index.html'));
+});
+
+app.use('/auth', express.static(path.join(__dirname, '../auth-frontend/dist')));
+
 
 // Room-based signaling and chat
 io.on('connection', socket => {
